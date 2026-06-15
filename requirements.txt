@@ -1,4 +1,5 @@
 pytest==8.0.0
+pytest-asyncio
 flake8==7.0.0
 langgraph
 langchain-core
