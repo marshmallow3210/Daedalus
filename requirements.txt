@@ -3,3 +3,4 @@ flake8==7.0.0
 langgraph
 langchain-core
 langchain-ollama
+chainlit>=2.9.4
