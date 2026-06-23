@@ -2,6 +2,11 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+# CJK fonts required for PIL to render Japanese characters in video frames
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends fonts-noto-cjk && \
+    rm -rf /var/lib/apt/lists/*
+
 # 安裝套件
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -5,3 +5,10 @@ langgraph
 langchain-core
 langchain-ollama
 chainlit>=2.9.4
+pillow
+moviepy
+edge-tts
+duckduckgo-search
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
