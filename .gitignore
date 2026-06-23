@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+secrets/yt_token.json
+secrets/client_secrets.json
+*.db
+videos/
