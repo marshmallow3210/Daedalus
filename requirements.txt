@@ -8,3 +8,4 @@ chainlit>=2.9.4
 pillow
 moviepy
 edge-tts
+duckduckgo-search
