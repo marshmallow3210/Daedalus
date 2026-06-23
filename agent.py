@@ -1,5 +1,13 @@
 from langchain_core.runnables import RunnableConfig
 import os
+import sys
+
+# Ensure the directory containing agent.py is always importable,
+# regardless of how Chainlit sets the working directory at runtime.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import encyclopedia  # noqa: E402 — must come after sys.path fix
+
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import MessagesState, StateGraph, END
@@ -111,7 +119,6 @@ def forge_and_test_tool(tool_code: str, test_code: str) -> str:
 def init_encyclopedia_db() -> str:
     """初始化日文百科全書 SQLite 資料庫，建立 japanese_encyclopedia 資料表。"""
     try:
-        import encyclopedia
         encyclopedia.init_db()
         return "日文百科全書資料庫初始化成功。"
     except Exception as e:
@@ -136,7 +143,6 @@ def add_japanese_word(word_json: str) -> str:
         return "錯誤：hiragana 欄位為必填。"
 
     try:
-        import encyclopedia
         encyclopedia.upsert_word(hiragana, **data)
         return f"單字「{hiragana}」已成功寫入百科全書。"
     except Exception as e:
@@ -149,7 +155,6 @@ def get_srs_due_words(limit: int = 20) -> str:
     import json
 
     try:
-        import encyclopedia
         words = encyclopedia.get_due_words(limit=limit)
         return json.dumps(words, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -165,7 +170,6 @@ def update_word_srs(hiragana: str, quality: int) -> str:
     if not 0 <= quality <= 5:
         return "錯誤：quality 必須在 0 到 5 之間。"
     try:
-        import encyclopedia
         found = encyclopedia.update_srs(hiragana, quality)
         if found:
             return f"單字「{hiragana}」的 SRS 排程已更新（評分：{quality}）。"
