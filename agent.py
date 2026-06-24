@@ -153,6 +153,13 @@ def add_japanese_word(word_json: str) -> str:
       - 含外來語音譯成分 → 需要
       - 慣用語或固定搭配 → 需要
       - 基礎詞彙（ありがとう 等）→ 不需要，etymology 留空
+
+    etymology 格式規範（每段以「，」分隔）：
+      每段必須遵守：「平假名或片假名（漢字）是中文意思」
+      例：す（酢）是醋，し（飯）是飯，醋飯之意
+      例：電（でん）是電力，車（しゃ）是車，電力驅動的車
+      括弧內放漢字形，「是」後接繁體中文意思。
+      最後可加一段總結（無需「是」結構），例：「醋飯之意」。
     """
     import json
     try:
@@ -316,43 +323,166 @@ def generate_japanese_learning_video(
                     pass
         return ImageFont.load_default()
 
-    def _make_frame(word: dict, idx: int) -> str:
-        W, H = 1920, 1080
-        has_etym = bool(word.get("etymology"))
-        img  = Image.new("RGB", (W, H), (12, 12, 35))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([(0, 0), (W, 6)], fill=(80, 130, 255))
-        draw.rectangle([(0, H - 6), (W, H)], fill=(80, 130, 255))
+    _EMOJI_FONT_PATHS = [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    ]
+    # Japanese traditional color palette for category badges
+    _BADGE_COLORS = {
+        "動物": (183,  65,  45),   # 朱色 vermillion
+        "食物": (155, 120,  45),   # 金色 gold
+        "飲料": ( 49,  79, 113),   # 藍色 indigo
+        "自然": ( 80, 115,  70),   # 萌葱色 green
+        "交通": ( 90,  75, 110),   # 江戶紫 purple
+        "物品": (120,  90,  55),   # 茶色 brown
+        "身體": (160,  85,  90),   # 紅梅色 pink
+    }
 
+    def _draw_emoji_on(base_img, emoji_str, x, y, size=130, tag=""):
+        """Render emoji with NotoColorEmoji (embedded_color=True), fall back to a colored badge."""
+        for ep in _EMOJI_FONT_PATHS:
+            if not os.path.exists(ep):
+                continue
+            try:
+                efont  = ImageFont.truetype(ep, 109)   # NotoColorEmoji native bitmap size
+                canvas = Image.new("RGBA", (300, 300), (0, 0, 0, 0))
+                cdraw  = ImageDraw.Draw(canvas)
+                cdraw.text((20, 20), emoji_str, font=efont, embedded_color=True)
+                bbox = canvas.getbbox()
+                if bbox and (bbox[2] - bbox[0]) > 10:
+                    cropped = canvas.crop(bbox)
+                    ow, oh  = cropped.size
+                    nw      = max(1, int(ow * size / oh))
+                    canvas  = cropped.resize((nw, size), Image.LANCZOS)
+                    base_img.paste(canvas, (x + (size - nw) // 2, y), canvas)
+                    return
+            except Exception:
+                pass
+        # Fallback: colored circle with category label
+        color = _BADGE_COLORS.get(tag, (80, 130, 255))
+        draw  = ImageDraw.Draw(base_img)
+        r     = size // 2
+        cx_c, cy_c = x + r, y + r
+        draw.ellipse([(cx_c - r, cy_c - r), (cx_c + r, cy_c + r)], fill=color)
+        label = tag[:2] if tag else (emoji_str[:1] if emoji_str else "?")
+        draw.text((cx_c, cy_c), label, fill=(255, 255, 255),
+                  font=_find_font(r), anchor="mm")
+
+    def _make_frame(word: dict, idx: int) -> str:
+        import re as _re
+        W, H = 1920, 1080
+
+        BG        = (252, 246, 235)
+        ORANGE    = (218, 108,  48)   # 橙色 warm Japanese orange
+        CHARCOAL  = ( 32,  26,  18)
+        SLATE     = ( 95, 105, 118)
+        VERMIL    = (183,  65,  45)   # 中文翻譯色
+        WARM_GRAY = (135, 123, 108)
+
+        img  = Image.new("RGB", (W, H), BG)
+        draw = ImageDraw.Draw(img)
+
+        # 最外圍四邊橘色邊框
+        BORDER = 10
+        draw.rectangle([(0, 0),          (W, BORDER)],      fill=ORANGE)   # 上
+        draw.rectangle([(0, H - BORDER), (W, H)],           fill=ORANGE)   # 下
+        draw.rectangle([(0, 0),          (BORDER, H)],      fill=ORANGE)   # 左
+        draw.rectangle([(W - BORDER, 0), (W, H)],           fill=ORANGE)   # 右
+
+        # JLPT 徽章（右上角）
         jlpt = word.get("jlpt_level", "")
         if jlpt:
-            draw.rounded_rectangle([(W - 130, 18), (W - 18, 58)], radius=8, fill=(80, 130, 255))
-            draw.text((W - 74, 38), jlpt, fill=(240, 240, 240), font=_find_font(26), anchor="mm")
+            draw.rounded_rectangle([(W - 152, 22), (W - 22, 64)], radius=6, fill=ORANGE)
+            draw.text((W - 87, 43), jlpt, fill=(252, 246, 235), font=_find_font(28), anchor="mm")
 
-        emoji_str = word.get("emoji", "")
-        if emoji_str:
-            draw.text((90, 120), emoji_str, fill=(240, 240, 240), font=_find_font(100), anchor="lm")
+        # ── Emoji：上下左右置中 ──────────────────────────────────
+        EMOJI_SIZE = 260
+        ex = W // 2 - EMOJI_SIZE // 2   # 水平置中
+        ey = H // 2 - EMOJI_SIZE // 2   # 垂直置中（ey=410, 底=670）
+        _draw_emoji_on(img, word.get("emoji", ""), ex, ey,
+                       size=EMOJI_SIZE, tag=word.get("tags", ""))
 
-        main = word.get("kanji") or word.get("katakana") or word.get("hiragana", "")
-        cy   = 280 if has_etym else 330
-        draw.text((W // 2, cy), main, fill=(240, 240, 240), font=_find_font(130), anchor="mm")
+        # ── 日文（漢字＋平假名ルビ逐字對齊，或純假名，Emoji 上方）──
+        kanji_str = word.get("kanji", "")
+        hira_str  = _re.sub(r"（[^）]*）", "", word.get("hiragana", "")).strip()
+        kata_str  = word.get("katakana", "")
 
-        reading = word.get("hiragana", "")
-        if reading and reading != main:
-            draw.text((W // 2, cy + 110), f"（{reading}）",
-                      fill=(160, 190, 255), font=_find_font(55), anchor="mm")
+        def _is_kanji(c): return "一" <= c <= "鿿" or "㐀" <= c <= "䶿"
+        def _is_kana(c):  return "ぁ" <= c <= "ヿ"
 
-        div_y = cy + 170
-        draw.rectangle([(W // 2 - 180, div_y), (W // 2 + 180, div_y + 3)], fill=(80, 130, 255))
+        # 比例分配演算法對特定詞產生錯誤對齊時的覆寫表
+        _RUBY_OVERRIDE = {
+            "でんわ":   [("電", "でん"), ("話", "わ")],
+            "ひこうき": [("飛", "ひ"),   ("行", "こう"), ("機", "き")],
+            "ぼうし":   [("帽", "ぼう"), ("子", "し")],
+        }
 
+        if kanji_str:
+            kf = _find_font(148)
+            rf = _find_font(58)
+            if hira_str in _RUBY_OVERRIDE:
+                assignments = _RUBY_OVERRIDE[hira_str]
+            else:
+                hlist = list(hira_str)
+                klist = list(kanji_str)
+                hi = 0
+                assignments = []          # (char, ruby_hiragana)
+                for i, ch in enumerate(klist):
+                    if _is_kana(ch):      # 漢字串中已是假名，直接對齊跳過
+                        eq = chr(ord(ch) - 0x60) if "ァ" <= ch <= "ヶ" else ch
+                        while hi < len(hlist) and hlist[hi] != eq:
+                            hi += 1
+                        assignments.append((ch, ""))
+                        if hi < len(hlist): hi += 1
+                    else:                 # 漢字：掃到下一個假名確定讀音邊界
+                        nxt = next((klist[j] for j in range(i+1, len(klist))
+                                    if _is_kana(klist[j])), None)
+                        st = hi
+                        if nxt:
+                            eq = chr(ord(nxt) - 0x60) if "ァ" <= nxt <= "ヶ" else nxt
+                            while hi < len(hlist) and hlist[hi] != eq:
+                                hi += 1
+                        else:
+                            rem_k = sum(1 for c in klist[i+1:] if _is_kanji(c))
+                            hi = len(hlist) if rem_k == 0 else \
+                                 hi + max(1, (len(hlist) - hi) // (rem_k + 1))
+                        assignments.append((ch, "".join(hlist[st:hi])))
+            # 計算每字寬度並置中
+            try:
+                ws = [max(10, int(kf.getlength(ch))) for ch, _ in assignments]
+            except AttributeError:
+                ws = [148] * len(assignments)
+            total_w = sum(ws)
+            x = W // 2 - total_w // 2
+            KANJI_Y = 232
+            RUBY_DY = 148 // 2 + 8 + 58 // 2   # 74 + 8 + 29 = 111
+            for (ch, ruby), w in zip(assignments, ws):
+                ccx = x + w // 2
+                draw.text((ccx, KANJI_Y), ch, fill=CHARCOAL, font=kf, anchor="mm")
+                if ruby:
+                    draw.text((ccx, KANJI_Y - RUBY_DY), ruby, fill=SLATE, font=rf, anchor="mm")
+                x += w
+        else:
+            draw.text((W // 2, 240), kata_str or hira_str,
+                      fill=CHARCOAL, font=_find_font(148), anchor="mm")
+
+        # ── 中文 + 字源（Emoji 下方，留寬鬆間距）──────────────
         cn = word.get("chinese_translation", "")
-        draw.text((W // 2, div_y + 80), cn, fill=(255, 210, 80), font=_find_font(85), anchor="mm")
+        draw.text((W // 2, 765), cn, fill=VERMIL, font=_find_font(82), anchor="mm")
 
         etym = word.get("etymology", "")
         if etym:
-            f_etym = _find_font(34)
-            for li, chunk in enumerate([etym[i:i+42] for i in range(0, min(len(etym), 126), 42)]):
-                draw.text((W // 2, 820 + li * 48), chunk, fill=(160, 160, 160), font=f_etym, anchor="mm")
+            etym_clean = _re.sub(r'\([A-Za-z ]+\)', '', etym).strip()
+            # 移除全形括弧內的漢字（如 す（酢）→ す），並在「是」前加空白
+            etym_clean = _re.sub(r'（[^）]*）', '', etym_clean).strip()
+            etym_clean = _re.sub(r'([^\s])是', r'\1 是', etym_clean)
+            parts = [p.strip() for p in _re.split(r'[，、]', etym_clean) if p.strip()]
+            lines = ["；".join(parts)] if len(parts) <= 2 else parts[:3]
+            f_e   = _find_font(30)
+            for li, line in enumerate(lines):
+                if len(line) > 48:
+                    line = line[:47] + "…"
+                draw.text((W // 2, 858 + li * 54), line, fill=WARM_GRAY, font=f_e, anchor="mm")
 
         path = os.path.join(tmp_dir, "frames", f"{idx:03d}.png")
         img.save(path, "PNG")
@@ -364,18 +494,38 @@ def generate_japanese_learning_video(
     consecutive_fails = 0
 
     for idx, word in enumerate(words):
-        hiragana = word.get("hiragana", "")
-        jp_say   = word.get("katakana") or word.get("kanji") or hiragana
+        import re as _re2b
+        hiragana = _re2b.sub(r"（[^）]*）", "", word.get("hiragana", "")).strip()
+        jp_say   = word.get("katakana") or hiragana or word.get("kanji") or ""
         cn_text  = word.get("chinese_translation", "")
         etym     = word.get("etymology", "")
 
-        jp_path   = os.path.join(tmp_dir, "audio", f"{idx:03d}_jp.mp3")
-        cn_path   = os.path.join(tmp_dir, "audio", f"{idx:03d}_cn.mp3")
-        etym_path = os.path.join(tmp_dir, "audio", f"{idx:03d}_etym.mp3")
+        jp_path = os.path.join(tmp_dir, "audio", f"{idx:03d}_jp.mp3")
+        cn_path = os.path.join(tmp_dir, "audio", f"{idx:03d}_cn.mp3")
 
         ok_jp = _tts_with_retry(jp_say, JP_VOICE, jp_path)
         ok_cn = cn_text and _tts_with_retry(cn_text, CN_VOICE, cn_path)
-        ok_et = etym and _tts_with_retry(etym, JP_VOICE, etym_path)
+
+        # 字源 TTS：每段「かな（漢字）是中文」拆成 JP念かな + CN念「是中文」
+        # 例：す（酢）是醋 → JP:「す」+ CN:「是醋」
+        import re as _re2
+        _seg_pat = _re2.compile(r'^(.+?)(?:（[^）]*）)?是(.+)$')
+        etym_audio_paths = []
+        if etym:
+            for si, seg in enumerate(s.strip() for s in etym.split('，') if s.strip()):
+                m = _seg_pat.match(seg)
+                if m:
+                    jp_e = os.path.join(tmp_dir, "audio", f"{idx:03d}_e{si}j.mp3")
+                    cn_e = os.path.join(tmp_dir, "audio", f"{idx:03d}_e{si}c.mp3")
+                    if _tts_with_retry(m.group(1).strip(), JP_VOICE, jp_e):
+                        etym_audio_paths.append(jp_e)
+                    if _tts_with_retry('是' + m.group(2).strip(), CN_VOICE, cn_e):
+                        etym_audio_paths.append(cn_e)
+                else:
+                    seg_tts = _re2.sub(r'（[^）]*）', '', seg).strip()
+                    all_e = os.path.join(tmp_dir, "audio", f"{idx:03d}_e{si}a.mp3")
+                    if _tts_with_retry(seg_tts, CN_VOICE, all_e):
+                        etym_audio_paths.append(all_e)
 
         if not ok_jp:
             consecutive_fails += 1
@@ -391,13 +541,13 @@ def generate_japanese_learning_video(
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return f"影片生成中止：連續 5 個單字 TTS 全部失敗，疑似網路異常。已處理 {idx} 個單字。"
 
-        # Build audio: JP → CN → JP (reuse jp_path) → etymology
+        # Build audio: JP → CN → JP（重用）→ 字源各段
         audio_parts = [AudioFileClip(jp_path)]
         if ok_cn:
             audio_parts.append(AudioFileClip(cn_path))
-        audio_parts.append(AudioFileClip(jp_path))   # second JP play reuses same file
-        if ok_et:
-            audio_parts.append(AudioFileClip(etym_path))
+        audio_parts.append(AudioFileClip(jp_path))
+        for ep in etym_audio_paths:
+            audio_parts.append(AudioFileClip(ep))
 
         full_audio = concatenate_audioclips(audio_parts)
         duration   = full_audio.duration + 0.5
@@ -416,7 +566,7 @@ def generate_japanese_learning_video(
 
         # Clean up per-word intermediates
         os.remove(frame_path)
-        for p in [jp_path, cn_path, etym_path]:
+        for p in [jp_path, cn_path] + etym_audio_paths:
             if os.path.exists(p):
                 os.remove(p)
 

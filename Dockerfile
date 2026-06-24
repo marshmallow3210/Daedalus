@@ -4,7 +4,9 @@ WORKDIR /app
 
 # CJK fonts required for PIL to render Japanese characters in video frames
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends fonts-noto-cjk && \
+    apt-get install -y --no-install-recommends \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji && \
     rm -rf /var/lib/apt/lists/*
 
 # 安裝套件
