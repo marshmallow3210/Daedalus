@@ -1,6 +1,12 @@
 from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+import json
 import os
+import re
 import sys
+import uuid
+from typing import Literal, Optional
+from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,6 +17,56 @@ from langchain_ollama import ChatOllama
 from langgraph.graph import MessagesState, StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
+
+# ──────────────────────────────────────────────────────────────
+# Pydantic models for structured reporting
+# ──────────────────────────────────────────────────────────────
+
+class TaskCompletionReport(BaseModel):
+    task_id: str = ""
+    task_description: str
+    modified_files: list[str]
+    change_summary: str
+    test_executed: bool
+    test_passed: Optional[bool] = None
+    risk_level: Literal["low", "medium", "high"]
+    risk_reason: str
+    tool_calls_made: list[str]
+
+
+class IssueItem(BaseModel):
+    severity: Literal["blocker", "major", "minor"]
+    category: Literal["correctness", "security", "edge_case", "test", "scope"]
+    description: str
+    location: Optional[str] = None
+    suggestion: Optional[str] = None
+
+
+class ReviewResult(BaseModel):
+    verdict: Literal["approve", "needs_changes"]
+    reviewer_risk: Literal["low", "medium", "high"]
+    issues: list[IssueItem]
+    approved_aspects: list[str]
+    one_line_summary: str
+
+
+# ──────────────────────────────────────────────────────────────
+# Extended graph state
+# ──────────────────────────────────────────────────────────────
+
+class DaedalusState(MessagesState):
+    task_report: Optional[dict]       # TaskCompletionReport.model_dump() or None
+    review_result: Optional[dict]     # ReviewResult.model_dump() or None
+    retry_count: int                  # Reviewer-driven retry counter
+    schema_error_count: int           # submit_task_completion parse failures
+    original_task: str                # snapshot of task_description at submit time
+    task_reporter_status: str         # "ok" | "retry" | "escalate" | ""
+    retry_messages: Optional[list]    # selective-amnesia context from context_surgeon; cleared by call_model
+    total_iterations: int             # Coder call_model runs since last successful submit; hard-capped at 6
+
+
+SUBMIT_TOOL_NAME = "submit_task_completion"
+
 
 # ──────────────────────────────────────────────────────────────
 # Tools — safe (no human review needed)
@@ -84,51 +140,168 @@ def python_executor(code: str) -> str:
 @tool
 def forge_and_test_tool(tool_code: str, test_code: str) -> str:
     """安全新增自定義工具：AST 掃描 → 沙盒 unittest → 寫入 custom_tools.py → reload。
-    tool_code 禁止含 import / exec / eval / open。
+    tool_code 規則：
+      - 禁止含 import / exec / eval / open / __builtins__ / getattr 等危險操作
+      - 禁止使用 @tool decorator（沙盒不提供 LangChain 環境，只寫純 def 函式）
+    回傳中含三個機器可讀標籤：
+      [AST_RESULT]PASS|FAIL[/AST_RESULT]
+      [TEST_RESULT]PASS|FAIL|SKIP[/TEST_RESULT]
+      [DISK_WRITE_RESULT]SUCCESS|FAIL|SKIP[/DISK_WRITE_RESULT]
+    modified_files 欄位只能在 DISK_WRITE_RESULT=SUCCESS 時填入對應檔案路徑。
     """
     import ast, unittest, importlib
     from io import StringIO
 
-    BLOCKED = {"exec", "eval", "open", "__import__"}
+    # ── Stage 1: AST Security Scan ──────────────────────────────────────────
+    # BLOCKED_CALLS: direct calls (func.id) or method calls (func.attr) both checked
+    BLOCKED_CALLS = {"exec", "eval", "open", "__import__", "getattr", "setattr",
+                     "import_module", "compile", "breakpoint"}
+    # BLOCKED_NAMES: bare Name nodes that give access to Python internals
+    BLOCKED_NAMES = {"__builtins__", "__globals__", "__locals__",
+                     "__import__", "__loader__", "__spec__"}
+
+    def _ast_fail(reason: str) -> str:
+        return (
+            f"[AST_RESULT]FAIL: {reason}[/AST_RESULT]\n"
+            f"[TEST_RESULT]SKIP[/TEST_RESULT]\n"
+            f"[DISK_WRITE_RESULT]SKIP[/DISK_WRITE_RESULT]\n"
+            f"安全掃描失敗：{reason}"
+        )
+
     try:
         tree = ast.parse(tool_code)
     except SyntaxError as e:
-        return f"AST 解析失敗：{e}"
+        return _ast_fail(f"AST 解析失敗：{e}")
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            return "安全掃描失敗：tool_code 禁止使用 import。"
+            return _ast_fail("tool_code 禁止使用 import 陳述式")
+        if isinstance(node, ast.Name) and node.id in BLOCKED_NAMES:
+            return _ast_fail(f"禁止存取受限識別字 {node.id!r}（間接 import 途徑）")
         if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if name in BLOCKED:
-                return f"安全掃描失敗：禁止呼叫 {name}()。"
+            call_name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if call_name in BLOCKED_CALLS:
+                return _ast_fail(f"禁止呼叫 {call_name}()")
 
-    sb = {"__builtins__": __import__("builtins")}
+    _ast_tag = "[AST_RESULT]PASS: 安全掃描通過[/AST_RESULT]"
+
+    # ── Stage 2: Sandbox Unit Test ──────────────────────────────────────────
+    # No-op `tool` handles both @tool (bare) and @tool("desc")/(@tool(return_direct=True) forms.
+    # lambda f: f only handles bare @tool; callable-check version handles both.
+    def _noop_tool(f=None, **_kw):
+        if callable(f):
+            return f        # @tool  — decorator applied directly to function
+        return lambda g: g  # @tool(...) — called with args, returns decorator
+
+    sb = {"__builtins__": __import__("builtins"), "tool": _noop_tool}
     try:
-        exec(tool_code, sb); exec(test_code, sb)
+        exec(tool_code, sb)
+        exec(test_code, sb)
     except Exception as e:
-        return f"沙盒載入失敗：{e}"
+        return (
+            f"{_ast_tag}\n"
+            f"[TEST_RESULT]FAIL: 沙盒載入失敗：{e}[/TEST_RESULT]\n"
+            f"[DISK_WRITE_RESULT]SKIP[/DISK_WRITE_RESULT]\n"
+            f"沙盒載入失敗：{e}"
+        )
 
-    loader = unittest.TestLoader(); suite = unittest.TestSuite()
+    loader = unittest.TestLoader()
+    suite  = unittest.TestSuite()
     for obj in sb.values():
         if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
             suite.addTests(loader.loadTestsFromTestCase(obj))
 
-    buf = StringIO()
+    buf    = StringIO()
     result = unittest.TextTestRunner(stream=buf, verbosity=2).run(suite)
     if not result.wasSuccessful():
-        return f"單元測試失敗，拒絕寫入：\n{buf.getvalue()}"
+        return (
+            f"{_ast_tag}\n"
+            f"[TEST_RESULT]FAIL: 單元測試失敗（{result.testsRun} tests, "
+            f"{len(result.failures)} failures, {len(result.errors)} errors）[/TEST_RESULT]\n"
+            f"[DISK_WRITE_RESULT]SKIP[/DISK_WRITE_RESULT]\n"
+            f"單元測試失敗，拒絕寫入：\n{buf.getvalue()}"
+        )
 
+    _test_tag = f"[TEST_RESULT]PASS: {result.testsRun} 個測試通過[/TEST_RESULT]"
+
+    # ── Stage 3: Disk Write ─────────────────────────────────────────────────
     path = os.getenv("CUSTOM_TOOLS_PATH", "/app/custom_tools.py")
+
+    # Strip @tool decorators before writing: custom_tools.py is plain Python,
+    # no LangChain runtime, so @tool would crash importlib.reload().
+    clean_code = re.sub(r'^[ \t]*@tool\b[^\n]*\n?', '', tool_code, flags=re.MULTILINE).strip()
+
+    def _upsert(file_path: str, new_code: str) -> None:
+        """Replace existing top-level functions with same name; append if new."""
+        try:
+            new_tree  = ast.parse(new_code)
+            new_names = {n.name for n in new_tree.body if isinstance(n, ast.FunctionDef)}
+        except Exception:
+            new_names = set()
+
+        if not new_names:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write("\n\n" + new_code)
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+            existing_tree = ast.parse(existing)
+        except Exception:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write("\n\n" + new_code)
+            return
+
+        # Collect line ranges of existing functions to replace (0-indexed).
+        remove_lines: set = set()
+        for node in existing_tree.body:
+            if not (isinstance(node, ast.FunctionDef) and node.name in new_names):
+                continue
+            first = (min(d.lineno for d in node.decorator_list)
+                     if node.decorator_list else node.lineno) - 1
+            remove_lines.update(range(first, node.end_lineno))
+
+        if not remove_lines:
+            # No existing definition — just append.
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write("\n\n" + new_code)
+            return
+
+        lines       = existing.splitlines(keepends=True)
+        kept        = [l for i, l in enumerate(lines) if i not in remove_lines]
+        new_content = "".join(kept).rstrip() + "\n\n\n" + new_code.strip() + "\n"
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n\n" + tool_code)
+        _upsert(path, clean_code)
     except Exception as e:
-        return f"寫入失敗：{e}"
+        return (
+            f"{_ast_tag}\n"
+            f"{_test_tag}\n"
+            f"[DISK_WRITE_RESULT]FAIL: 寫入磁碟失敗：{e}[/DISK_WRITE_RESULT]\n"
+            f"⚠️ AST + 測試均通過，但磁碟寫入失敗（{e}）。\n"
+            f"modified_files 必須傳 []，不得填入 {path}。"
+        )
+
     try:
-        import custom_tools; importlib.reload(custom_tools)
-        return f"工具已成功寫入並動態載入！\n{buf.getvalue()}"
+        import custom_tools
+        importlib.reload(custom_tools)
+        return (
+            f"{_ast_tag}\n"
+            f"{_test_tag}\n"
+            f"[DISK_WRITE_RESULT]SUCCESS: 工具已寫入 {path} 並動態載入[/DISK_WRITE_RESULT]\n"
+            f"工具已成功寫入並動態載入！\n{buf.getvalue()}"
+        )
     except Exception as e:
-        return f"動態 reload 失敗：{e}"
+        # File written but reload failed — disk state is still SUCCESS
+        return (
+            f"{_ast_tag}\n"
+            f"{_test_tag}\n"
+            f"[DISK_WRITE_RESULT]SUCCESS: 工具已寫入 {path}（reload 失敗：{e}）[/DISK_WRITE_RESULT]\n"
+            f"工具已寫入磁碟，但動態 reload 失敗（{e}）。需要手動重啟載入。"
+        )
 
 
 @tool
@@ -748,6 +921,40 @@ def delete_local_video(local_path: str, batch_id: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# Tools — submit (bind_tools only; intercepted by task_reporter, never run by ToolNode)
+# ──────────────────────────────────────────────────────────────
+
+@tool
+def submit_task_completion(
+    task_description: str,
+    modified_files: list,
+    change_summary: str,
+    test_executed: bool,
+    risk_level: str,
+    risk_reason: str,
+    tool_calls_made: list,
+    test_passed: Optional[bool] = None,
+) -> str:
+    """[任務完成強制回報] 每次完成實作任務後必須呼叫，不得用純文字代替。
+
+    task_description : 複述使用者當前任務需求（用執行當下最新版本，非最早那則）
+    modified_files   : 確實被改動的檔案路徑清單（無改動傳 []）
+    change_summary   : diff 精簡描述，100 字以內，不貼全文
+    test_executed    : 是否呼叫過 forge_and_test_tool 或其他測試工具
+    test_passed      : 測試結果（test_executed=false 時傳 null）
+    risk_level       : low / medium / high（僅反映程式碼改動本身的品質風險）
+                       low    = 只讀操作，或呼叫危險工具但無程式碼寫入
+                       medium = 有寫入/DB 操作，且測試通過
+                       high   = 測試失敗、修改現有工具定義、涉安全邏輯
+                       ⚠️ 「呼叫危險工具」不納入此欄位——危險工具的執行風險已由 interrupt_before 獨立管控
+    risk_reason      : 一句話說明風險等級理由
+    tool_calls_made  : 本次任務實際呼叫的所有工具名稱
+    """
+    # 此函式由 task_reporter 節點攔截，不會實際執行
+    return "[此工具由 task_reporter 節點攔截處理]"
+
+
+# ──────────────────────────────────────────────────────────────
 # Tool registry & routing
 # ──────────────────────────────────────────────────────────────
 
@@ -759,8 +966,10 @@ _safe_tools = [
     get_video_candidate_words, generate_japanese_learning_video,
 ]
 _dangerous_tools = [upload_to_youtube, delete_local_video]
+_submit_tools    = [submit_task_completion]  # bind_tools only; NOT in ToolNode
 
-all_tools = _safe_tools + _dangerous_tools
+all_tools  = _safe_tools + _dangerous_tools          # tools ToolNode handles
+_llm_tools = all_tools + _submit_tools               # full schema set for LLM
 tool_node  = ToolNode(all_tools)
 
 # ──────────────────────────────────────────────────────────────
@@ -774,7 +983,21 @@ llm = ChatOllama(
     base_url=OLLAMA_BASE_URL,
     temperature=0.2,
     streaming=True,
-).bind_tools(all_tools)
+).bind_tools(_llm_tools)
+
+# Reviewer: qwen2.5-coder:7b — Alibaba Cloud training lineage, independent from Google gemma4.
+# Must be instruction-tuned: the Reviewer must follow the system prompt and output
+# strictly-formatted JSON. Selection history:
+#   starcoder2:7b       → no instruction tuning, JSON validity 0/3, 100% fallback
+#   codellama:7b-instruct → valid JSON 3/3, but review quality 0/3 (approved all errors)
+#   qwen2.5-coder:7b    → instruction-tuned + strong code reasoning = final choice
+# Security: local Ollama inference, data never leaves host, localhost-bound only.
+reviewer_llm = ChatOllama(
+    model="qwen2.5-coder:7b",
+    base_url=OLLAMA_BASE_URL,
+    temperature=0.1,
+    streaming=False,
+)
 
 # ──────────────────────────────────────────────────────────────
 # Graph nodes
@@ -787,6 +1010,45 @@ SYSTEM_PROMPT = """你是配備多種工具的全能助理 Daedalus，專精日�
 2. 若工具回傳錯誤，必須如實呈現完整錯誤訊息，不得宣稱操作成功。
 3. 不確定的事實禁止臆測，應呼叫 web_search 查詢後再回答。
 4. 回覆一律使用繁體中文。
+5. 每次完成實作任務後，必須呼叫 submit_task_completion 提交結構化回報，不得用純文字代替。
+
+【建立／修改工具的強制流程 — 最常見的違規情境】
+當任務涉及「建立、撰寫、修改任何 Python 函式或工具」，唯一合法的完成方式是：
+  Step 0. 先用 1-3 句話說明「我要做什麼」與「打算怎麼做」（例：「我要建立計算階乘的函式，
+           包含正整數、零的計算，以及負數拋出 ValueError 的防禦性處理。」），然後直接執行，不需等使用者確認。
+  Step A. 呼叫 forge_and_test_tool(tool_code=<完整函式>, test_code=<單元測試>)
+  Step B. 讀取回傳的 [AST_RESULT] / [TEST_RESULT] / [DISK_WRITE_RESULT] 三段標籤
+  Step C. 測試失敗則修正後重試，不得宣稱成功
+  Step D. 呼叫 submit_task_completion 提交結構化回報
+
+【forge_and_test_tool 的 tool_code 寫法】
+  ✅ 只寫純 Python def 函式，無任何 decorator
+  ✅ 不使用 import（沙盒環境不支援，import 陳述式會直接失敗）
+  ✗ 禁止加 @tool decorator（沙盒不認識，會報 name 'tool' is not defined）
+  ✗ 禁止 @staticmethod / @classmethod / @property 等 decorator（除非是內部 class）
+
+以下行為在任何情況下均屬違規（系統會偵測並強制重做）：
+  ✗ 在訊息裡用 ```python 程式碼區塊展示程式碼，未呼叫任何工具
+  ✗ 說「以下是程式碼，請自行貼入」或「已為你撰寫好如下」
+  ✗ 以「環境限制」「目錄唯讀」等理由改用純文字展示（應試後如實回報錯誤）
+  ✗ 沒有呼叫 forge_and_test_tool 就直接呼叫 submit_task_completion
+
+【submit_task_completion 填寫規範】
+- task_description : 複述當前執行的任務需求（用最新版本，非對話最早那則）
+- modified_files   : 確實已寫入磁碟的檔案路徑清單（無改動傳 []）
+    ⚠️ 判斷標準：forge_and_test_tool 回傳 [DISK_WRITE_RESULT]SUCCESS 才可填入對應路徑
+       若回傳 DISK_WRITE_RESULT=FAIL 或 SKIP，必須傳 []，不得因沙盒測試通過就填入
+- change_summary   : diff 精簡描述，100 字以內
+- test_executed    : forge_and_test_tool 或其他測試工具是否執行且有明確 [TEST_RESULT]
+- test_passed      : [TEST_RESULT]PASS 則 true，FAIL 則 false（test_executed=false 時傳 null）
+- risk_level       : low / medium / high（僅反映程式碼改動本身的品質風險）
+    low    = 只讀操作，或呼叫危險工具但無程式碼寫入（純動作任務）
+    medium = 有寫入/DB 操作，且測試通過
+    high   = 測試失敗、修改現有工具定義、涉及安全邏輯
+    ⚠️ 「呼叫危險工具」不列入此欄位——危險工具的執行已由 interrupt_before 獨立管控，不透過 risk_level 觸發 human_escalation
+- risk_reason      : 一句話說明為何是這個等級
+- tool_calls_made  : 本次任務「所有呼叫過的工具名稱清單」，包含失敗／放棄的嘗試
+    ⚠️ 不得只列最終生效的工具；forge_and_test_tool 嘗試多次也必須列出
 
 【日文影片製作標準流程】
 Step 1. get_video_candidate_words — 確認有哪些單字尚未拍攝
@@ -804,48 +1066,635 @@ Step 6. delete_local_video — 刪除本機影片（⚠️ 需人工核准，確
 """
 
 
-async def call_model(state: MessagesState, config: RunnableConfig):
+REVIEWER_SYSTEM_PROMPT = """你是一位嚴格的程式碼審查員（Code Reviewer），職責是找出問題，不是讚美。
+你的唯一目標是保護系統不被引入缺陷、安全漏洞或未完成的實作。
+
+═══════════════════════════════════════════════════════
+【CRITICAL RULE】category: "scope" 的合法使用限制
+═══════════════════════════════════════════════════════
+以下程式碼【絕對禁止】被標記為 category: "scope"：
+  ✅ isinstance / type() 型別檢查
+  ✅ raise ValueError / raise TypeError
+  ✅ if n < 0、if x is None、if not lst 等邊界防禦
+  ✅ try/except、finally、raise、guard clause
+  ✅ 任何防禦性輸入驗證或錯誤處理
+
+【唯一合法的 scope creep】：改動新增了與原始任務完全無關的全新功能。
+  ✅ 正確範例：任務是「寫階乘函式」，diff 還額外加了一個 fetch_url 函式 → scope
+  ❌ 錯誤範例：任務是「寫階乘函式」，diff 包含 `if n < 0: raise ValueError` → 不是 scope，應是 edge_case
+
+在標記 category: "scope" 之前，必須確認：
+  (1) 這段程式碼不屬於輸入驗證、邊界條件、錯誤處理的任何一種
+  (2) 這是一個與原始任務毫無關聯的全新功能
+  兩個條件都不成立 → 禁止使用 category: "scope"
+═══════════════════════════════════════════════════════
+
+行為規範：
+1. 凡有疑慮，必須列為 issue，不得因「看起來應該 OK」而放行。
+2. 你看不到實作者的推理過程——這是刻意的設計，你的判斷必須完全基於改動的結果。
+3. 若任何欄位資訊不足以判斷，在 issues 中標記「資訊不足，需要人工確認」。
+
+verdict 判定規則（必須遵守）：
+- 有任何 severity=blocker 的 issue → verdict 必須是 needs_changes
+- major issue 數量 >= 2 → verdict 必須是 needs_changes
+- 只有 minor issue → 可以 approve（仍需列出 issues）
+
+你的回覆必須只包含以下格式的 JSON，不得附加任何前言、解釋或後記：
+
+{
+  "verdict": "approve",
+  "reviewer_risk": "low",
+  "issues": [],
+  "approved_aspects": ["邏輯正確", "邊界處理完整", "符合原始任務需求"],
+  "one_line_summary": "一句話結論"
+}
+
+【approved_aspects 填寫規則——必須遵守】
+- 不得為空陣列 []
+- 每條必須是具體說明，例如：「邏輯正確：factorial(5)=120 計算正確」、「邊界處理：負數拋 ValueError」
+- 若 verdict = "approve"，approved_aspects 至少要有 2 條
+- 若 verdict = "needs_changes"，至少要有 1 條（說明哪些面向是 OK 的）
+
+issue 物件格式：
+{
+  "severity": "blocker",
+  "category": "correctness",
+  "description": "問題描述",
+  "location": null,
+  "suggestion": null
+}
+
+severity 只能是：blocker / major / minor
+category 只能是：correctness / security / edge_case / test / scope
+verdict 只能是：approve / needs_changes
+reviewer_risk 只能是：low / medium / high
+"""
+
+
+def _extract_tagged_result(messages: list, tag: str) -> Optional[str]:
+    """Return the most recent [TAG]...[/TAG] content from messages."""
+    open_tag  = f"[{tag}]"
+    close_tag = f"[/{tag}]"
+    pattern   = re.compile(re.escape(open_tag) + r"(.*?)" + re.escape(close_tag), re.DOTALL)
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "") or ""
+        if open_tag in content:
+            m = pattern.search(content)
+            if m:
+                return m.group(1).strip()
+    return None
+
+
+def _extract_ast_result(messages: list) -> Optional[str]:
+    """Return the most recent [AST_RESULT]...[/AST_RESULT] content."""
+    return _extract_tagged_result(messages, "AST_RESULT")
+
+
+def _extract_disk_write_result(messages: list) -> Optional[str]:
+    """Return the most recent [DISK_WRITE_RESULT]...[/DISK_WRITE_RESULT] content."""
+    return _extract_tagged_result(messages, "DISK_WRITE_RESULT")
+
+
+def _build_reviewer_input(
+    task_report: dict,
+    original_task: str,
+    ast_scan_result: Optional[str],
+    disk_write_result: Optional[str] = None,
+) -> str:
+    modified_files  = task_report.get("modified_files") or []
+    change_summary  = task_report.get("change_summary", "（無摘要）")
+    test_executed   = task_report.get("test_executed", False)
+    test_passed     = task_report.get("test_passed")
+    risk_level      = task_report.get("risk_level", "unknown")
+    risk_reason     = task_report.get("risk_reason", "（未說明）")
+    tool_calls_made = task_report.get("tool_calls_made") or []
+
+    if not test_executed:
+        test_status = "否（未執行測試）"
+    elif test_passed is True:
+        test_status = "是，且通過"
+    elif test_passed is False:
+        test_status = "是，但失敗"
+    else:
+        test_status = "是（結果未知）"
+
+    ast_txt   = ast_scan_result   or "未取得（non-forge 任務或標籤缺失）"
+    disk_txt  = disk_write_result or "未取得（non-forge 任務或標籤缺失）"
+    files_txt = "\n".join(f"- {f}" for f in modified_files) or "- （無改動）"
+    tools_txt = ", ".join(tool_calls_made) or "（無）"
+
+    return (
+        f"請審查以下任務的完成情況。\n\n"
+        f"【原始任務需求】\n{original_task or '（未記錄）'}\n\n"
+        f"【改動摘要】\n{change_summary}\n\n"
+        f"【宣告改動的檔案（modified_files）】\n{files_txt}\n\n"
+        f"【測試狀態（Coder 自報）】\n{test_status}\n\n"
+        f"【實作者自評風險等級】\n{risk_level} — {risk_reason}\n\n"
+        f"【AST 靜態分析結果（機器回傳）】\n{ast_txt}\n\n"
+        f"【磁碟寫入結果（機器回傳）】\n{disk_txt}\n"
+        f"  ⚠️ modified_files 只在 DISK_WRITE_RESULT=SUCCESS 時才合法；"
+        f"若 Coder 填了 modified_files 但 DISK_WRITE_RESULT 非 SUCCESS，請標記為 blocker。\n\n"
+        f"【實際使用的工具清單（Coder 自報）】\n{tools_txt}\n\n"
+        f"請根據以上資訊進行審查，輸出 JSON 格式的審查結果。"
+    )
+
+
+def _parse_review_result(text: str) -> ReviewResult:
+    """Extract JSON from LLM response text and parse into ReviewResult."""
+    # Try ```json ... ``` block first
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        return ReviewResult(**json.loads(m.group(1)))
+    # Fallback: first {...} in the text
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        return ReviewResult(**json.loads(m.group(0)))
+    raise ValueError(f"回應中找不到有效 JSON：{text[:300]!r}")
+
+
+# Keywords that identify defensive-programming issues wrongly labelled as "scope"
+_DEFENSIVE_SCOPE_KW = [
+    "負數", "零", "none", "空字串", "空列表", "空 list", "空陣列",
+    "isinstance", "valueerror", "typeerror",
+    "raise", "try/except", "try-except", "guard",
+    "錯誤處理", "邊界", "輸入驗證", "防禦性",
+    "input validation", "error handling", "edge case",
+    "if n <", "if n<=", "if x is none", "< 0",
+]
+
+
+def _strip_false_scope_issues(result: ReviewResult) -> ReviewResult:
+    """
+    Post-filter: drop scope-category issues that describe defensive programming.
+    Recalculate verdict based on remaining issues so a false-scope blocker
+    doesn't block approval.
+    """
+    kept, dropped = [], []
+    for issue in result.issues:
+        if issue.category == "scope":
+            desc_lower = issue.description.lower()
+            if any(kw in desc_lower for kw in _DEFENSIVE_SCOPE_KW):
+                dropped.append(issue)
+                continue
+        kept.append(issue)
+
+    if not dropped:
+        return result
+
+    has_blocker  = any(i.severity == "blocker" for i in kept)
+    major_count  = sum(1 for i in kept if i.severity == "major")
+    new_verdict  = "needs_changes" if (has_blocker or major_count >= 2) else "approve"
+    suffix       = "（scope 誤判已自動過濾）" if new_verdict == "approve" else ""
+    return ReviewResult(
+        verdict          = new_verdict,
+        reviewer_risk    = result.reviewer_risk,
+        issues           = kept,
+        approved_aspects = result.approved_aspects,
+        one_line_summary = result.one_line_summary + suffix,
+    )
+
+
+async def call_model(state: DaedalusState, config: RunnableConfig):
     sys_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    # After context_surgeon sets retry_messages, use that clean slate;
+    # otherwise use the full accumulated history.
+    context = state.get("retry_messages") or state["messages"]
     final = None
-    async for chunk in llm.astream([sys_msg] + state["messages"], config=config):
+    async for chunk in llm.astream([sys_msg] + context, config=config):
         final = chunk if final is None else final + chunk
-    return {"messages": [final]}
+    return {
+        "messages":         [final],
+        "retry_messages":   None,
+        "total_iterations": (state.get("total_iterations") or 0) + 1,
+    }
 
 
-def pre_tool_check(state: MessagesState) -> dict:
+def pre_tool_check(state: DaedalusState) -> dict:
     """No-op passthrough — interrupt_before fires here for dangerous tools."""
     return {}
 
 
-def route_after_agent(state: MessagesState) -> str:
+def task_reporter(state: DaedalusState) -> dict:
+    """
+    Intercepts submit_task_completion, validates TaskCompletionReport schema,
+    and implements 3-tier degradation:
+      parse OK          → status="ok"   → reviewer_agent (Block 2 wires this)
+      first parse fail  → status="retry" → back to agent with error
+      second parse fail → status="escalate" → human_escalation
+    """
+    last_msg = state["messages"][-1]
+    tool_calls = getattr(last_msg, "tool_calls", []) or []
+    schema_error_count = state.get("schema_error_count") or 0
+
+    submit_call = None
+    other_calls = []
+    for tc in tool_calls:
+        if tc["name"] == SUBMIT_TOOL_NAME:
+            submit_call = tc
+        else:
+            other_calls.append(tc)
+
+    # Stub ToolMessages for any non-submit calls (they were never executed)
+    extra_msgs = [
+        ToolMessage(
+            content=(
+                f"[跳過] {tc['name']} 無法在 submit_task_completion 同一輪中執行。"
+                "請在下一輪單獨呼叫。"
+            ),
+            tool_call_id=tc["id"],
+        )
+        for tc in other_calls
+    ]
+
+    if not submit_call:
+        return {"messages": extra_msgs}
+
+    try:
+        args = dict(submit_call["args"])
+        # Coerce stringified lists (some models serialize list as JSON string)
+        for field in ("modified_files", "tool_calls_made"):
+            val = args.get(field)
+            if isinstance(val, str):
+                try:
+                    args[field] = json.loads(val)
+                except Exception:
+                    args[field] = [val]
+        args["task_id"] = uuid.uuid4().hex[:8]
+        report = TaskCompletionReport(**args)
+
+        ok_msg = ToolMessage(
+            content=f"[SUBMIT_OK] 任務回報驗證成功，task_id={report.task_id}",
+            tool_call_id=submit_call["id"],
+        )
+        # Anchor original_task to the real user HumanMessage (set only once).
+        # Using Coder's task_description risks vague/evolving rephrasing that
+        # misleads the Reviewer into flagging the core task as scope creep.
+        existing_original = state.get("original_task") or ""
+        if not existing_original:
+            user_msg = next(
+                (m for m in state["messages"]
+                 if isinstance(m, HumanMessage)
+                 and not (m.content or "").startswith(_ENFORCER_MARKER)),
+                None,
+            )
+            original_task_anchor = (user_msg.content or "").strip() if user_msg else report.task_description
+        else:
+            original_task_anchor = existing_original
+        return {
+            "messages":             extra_msgs + [ok_msg],
+            "task_report":          report.model_dump(),
+            "original_task":        original_task_anchor,
+            "schema_error_count":   0,
+            "task_reporter_status": "ok",
+            "total_iterations":     0,   # Reset counter on each successful submission
+        }
+
+    except Exception as e:
+        schema_error_count += 1
+        if schema_error_count >= 2:
+            err_msg = ToolMessage(
+                content=(
+                    f"[SUBMIT_ESCALATE] submit_task_completion 連續失敗 {schema_error_count} 次，"
+                    f"需要人工介入。錯誤：{e}"
+                ),
+                tool_call_id=submit_call["id"],
+            )
+            return {
+                "messages":             extra_msgs + [err_msg],
+                "schema_error_count":   schema_error_count,
+                "task_reporter_status": "escalate",
+            }
+        else:
+            err_msg = ToolMessage(
+                content=(
+                    f"[SUBMIT_ERROR] submit_task_completion 格式錯誤（第 {schema_error_count} 次）。\n"
+                    f"錯誤：{e}\n"
+                    f"必填欄位：task_description, modified_files, change_summary, "
+                    f"test_executed, risk_level（low/medium/high）, risk_reason, tool_calls_made。"
+                ),
+                tool_call_id=submit_call["id"],
+            )
+            return {
+                "messages":             extra_msgs + [err_msg],
+                "schema_error_count":   schema_error_count,
+                "task_reporter_status": "retry",
+            }
+
+
+def human_escalation(state: DaedalusState) -> dict:
+    """Escalation node — interrupt_before fires here; Chainlit UI handled in _handle_interrupt."""
+    return {}
+
+
+def context_surgeon(state: DaedalusState) -> dict:
+    """
+    Selective amnesia on retry: strips all Coder AIMessages, keeps objective
+    ToolMessages + the original user HumanMessage, then appends a synthesised
+    Reviewer-feedback HumanMessage that includes the already-completed-tools
+    summary (non-idempotent tools are flagged so the Coder avoids re-running
+    them).  The result is stored in retry_messages; call_model reads and
+    clears it so the full messages history is still preserved for audit.
+    """
+    messages      = state["messages"]
+    review_result = state.get("review_result") or {}
+    retry_count   = state.get("retry_count") or 0
+
+    NON_IDEMPOTENT    = {"forge_and_test_tool", "generate_japanese_learning_video"}
+    FAILURE_KEYWORDS  = ("失敗", "錯誤", "Error", "error", "Exception", "無法")
+    INTERNAL_PREFIXES = ("[SUBMIT_OK]", "[SUBMIT_ERROR]", "[SUBMIT_ESCALATE]", "[跳過]")
+
+    # ── Pass 1: tool_call_id → tool_name + forge function names ──────────────────
+    # (must be done BEFORE stripping AIMessages)
+    id_to_name:       dict[str, str] = {}
+    id_to_forge_func: dict[str, str] = {}  # tool_call_id → def name inside tool_code
+    for msg in messages:
+        for tc in getattr(msg, "tool_calls", None) or []:
+            if not isinstance(tc, dict):
+                continue
+            id_to_name[tc["id"]] = tc["name"]
+            if tc["name"] == "forge_and_test_tool":
+                tool_code = (tc.get("args") or {}).get("tool_code", "")
+                m = re.search(r"^def\s+(\w+)", tool_code, re.MULTILINE)
+                if m:
+                    id_to_forge_func[tc["id"]] = m.group(1)
+
+    # ── Pass 2: classify ToolMessages ──────────────────────────────────────────
+    completed: dict[str, dict] = {}
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content or ""
+        if any(content.startswith(p) for p in INTERNAL_PREFIXES):
+            continue
+        name = id_to_name.get(msg.tool_call_id, "unknown")
+        if name in (SUBMIT_TOOL_NAME, "unknown"):
+            continue
+        success = not any(kw in content for kw in FAILURE_KEYWORDS)
+        if name not in completed:
+            completed[name] = {
+                "count": 0,
+                "success": True,
+                "non_idempotent": name in NON_IDEMPOTENT,
+                "last_forge_func": None,
+            }
+        completed[name]["count"] += 1
+        if not success:
+            completed[name]["success"] = False
+        func = id_to_forge_func.get(msg.tool_call_id)
+        if func:
+            completed[name]["last_forge_func"] = func
+
+    # ── Pass 3: strip AIMessages, skip internal ToolMessages ───────────────────
+    cleaned = []
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            continue
+        if isinstance(msg, ToolMessage):
+            if any((msg.content or "").startswith(p) for p in INTERNAL_PREFIXES):
+                continue
+        cleaned.append(msg)
+
+    # ── Build "already completed tools" summary ─────────────────────────────────
+    ni_ok_lines, ni_fail_lines, safe_lines = [], [], []
+    for name, info in completed.items():
+        status    = "✅" if info["success"] else "❌"
+        func_hint = f"（函式名：{info['last_forge_func']}）" if info.get("last_forge_func") else ""
+        line      = f"  - {name} × {info['count']}  {status}{func_hint}"
+        if info["non_idempotent"]:
+            (ni_ok_lines if info["success"] else ni_fail_lines).append(line)
+        else:
+            safe_lines.append(line)
+
+    summary_sections = []
+    if ni_ok_lines:
+        summary_sections.append(
+            "★ 有持久副作用（已成功寫入 / 生成，請勿重複呼叫相同版本）：\n"
+            + "\n".join(ni_ok_lines)
+            + "\n    ⚠️ 若需覆蓋，請以相同函式名稱修正後重新呼叫，不得另建新函式"
+        )
+    if ni_fail_lines:
+        summary_sections.append(
+            "⚠️ 寫入 / 生成失敗（磁碟未改動，可安全重新呼叫）：\n"
+            + "\n".join(ni_fail_lines)
+            + "\n    → 請修正程式碼後，以相同函式名稱重新呼叫 forge_and_test_tool，不得換名另建"
+        )
+    if safe_lines:
+        summary_sections.append(
+            "◎ 安全重複（冪等或純讀取）：\n" + "\n".join(safe_lines)
+        )
+
+    completed_summary = (
+        "[已完成操作摘要 — 重試請確認後再執行]\n\n"
+        + "\n\n".join(summary_sections)
+        + "\n\n---\n\n"
+    ) if summary_sections else ""
+
+    # ── Build Reviewer feedback message ────────────────────────────────────────
+    one_line   = review_result.get("one_line_summary", "")
+    issues     = review_result.get("issues", [])
+    _sev       = {"blocker": "[blocker]", "major": "[major]", "minor": "[minor]"}
+    issues_txt = "\n".join(
+        f"- {_sev.get(i['severity'], '[?]')} {i['description']}"
+        + (f"（{i['location']}）" if i.get("location") else "")
+        + (f" → {i['suggestion']}"  if i.get("suggestion")  else "")
+        for i in issues
+    ) or "（無具體問題清單）"
+
+    feedback = HumanMessage(content=(
+        f"{completed_summary}"
+        f"[Reviewer 審查結果 — 第 {retry_count} 次 / 共 3 次]\n\n"
+        f"結論：{one_line}\n\n"
+        f"問題清單：\n{issues_txt}\n\n"
+        f"以上工具執行記錄（ToolMessages）已保留供參考。\n"
+        f"請重新審視原始任務，修正後再次呼叫 submit_task_completion 提交。"
+    ))
+    cleaned.append(feedback)
+
+    return {"retry_messages": cleaned}
+
+
+async def reviewer_agent(state: DaedalusState) -> dict:
+    """
+    Independent review using qwen2.5-coder:7b (Alibaba Cloud lineage, instruction-tuned).
+    Context isolation: only TaskCompletionReport data + original_task are passed.
+    No Coder conversation history, no Coder reasoning.
+    """
+    task_report   = state.get("task_report") or {}
+    original_task = state.get("original_task") or ""
+    retry_count   = state.get("retry_count") or 0
+
+    ast_scan_result   = _extract_ast_result(state["messages"])
+    disk_write_result = _extract_disk_write_result(state["messages"])
+    reviewer_input    = _build_reviewer_input(
+        task_report, original_task, ast_scan_result, disk_write_result
+    )
+
+    try:
+        response = await reviewer_llm.ainvoke([
+            {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
+            {"role": "user",   "content": reviewer_input},
+        ])
+        result = _parse_review_result(response.content)
+        result = _strip_false_scope_issues(result)
+    except Exception as e:
+        result = ReviewResult(
+            verdict="needs_changes",
+            reviewer_risk="high",
+            issues=[IssueItem(
+                severity="blocker",
+                category="correctness",
+                description=f"Reviewer 輸出解析失敗，需人工確認。技術錯誤：{e}",
+            )],
+            approved_aspects=["無法評估"],
+            one_line_summary=f"Reviewer 解析失敗（{e}），需人工確認",
+        )
+
+    new_retry_count = retry_count + 1 if result.verdict == "needs_changes" else retry_count
+
+    return {
+        "review_result": result.model_dump(),
+        "retry_count":   new_retry_count,
+    }
+
+
+def route_after_reviewer(state: DaedalusState) -> str:
+    rr            = state.get("review_result") or {}
+    verdict       = rr.get("verdict",       "needs_changes")
+    reviewer_risk = rr.get("reviewer_risk", "high")
+    coder_risk    = (state.get("task_report") or {}).get("risk_level", "high")
+    retry_count   = state.get("retry_count") or 0
+
+    # Either party flagging high risk → always require human confirmation
+    if coder_risk == "high" or reviewer_risk == "high":
+        return "human_escalation"
+
+    if verdict == "approve":
+        return "end"
+
+    # needs_changes: retry_count was already incremented in reviewer_agent
+    if retry_count >= 3:
+        return "human_escalation"
+    return "context_surgeon"
+
+
+_ENFORCER_MARKER = "[TOOL_ENFORCER]"
+
+
+def tool_enforcer(state: DaedalusState) -> dict:
+    """
+    Fires when the agent outputs a Python code block without calling any tool.
+    Injects a correction HumanMessage and routes back to agent for one retry.
+    Only fires once per conversation segment (marker prevents infinite loop).
+    """
+    return {
+        "messages": [HumanMessage(content=(
+            f"{_ENFORCER_MARKER} ⚠️ 系統偵測到你以 markdown 程式碼區塊回應，未呼叫任何工具。\n\n"
+            "根據強制規則【建立／修改工具的強制流程】：\n"
+            "- 建立或修改函式必須呼叫 forge_and_test_tool，不得以純文字展示代替\n"
+            "- 在訊息裡貼程式碼不等於「已建立工具」\n\n"
+            "請重新執行：呼叫 forge_and_test_tool(tool_code=..., test_code=...) 提交程式碼。"
+        ))]
+    }
+
+
+def route_after_agent(state: DaedalusState) -> str:
+    # Hard iteration cap — catches forge-fail loops that bypass retry_count.
+    if (state.get("total_iterations") or 0) >= 6:
+        return "human_escalation"
+
     last = state["messages"][-1]
     if not getattr(last, "tool_calls", None):
+        content = getattr(last, "content", "") or ""
+        # Detect "code block without tool call" — catch the most common bypass pattern.
+        # Only enforce once: if the enforcer marker already exists in recent history,
+        # the agent had its chance and still refused; let it end rather than loop.
+        has_python_block = "```python" in content or "```Python" in content
+        already_enforced = any(
+            isinstance(m, HumanMessage) and _ENFORCER_MARKER in (m.content or "")
+            for m in state["messages"][-8:]
+        )
+        if has_python_block and not already_enforced:
+            return "tool_enforcer"
         return "end"
-    if any(tc["name"] in DANGEROUS_TOOL_NAMES for tc in last.tool_calls):
+    tool_names = [tc["name"] for tc in last.tool_calls]
+    if SUBMIT_TOOL_NAME in tool_names:
+        return "task_reporter"
+    if any(name in DANGEROUS_TOOL_NAMES for name in tool_names):
         return "pre_tool_check"
     return "tools"
+
+
+def route_after_task_reporter(state: DaedalusState) -> str:
+    status = state.get("task_reporter_status") or ""
+    if status == "escalate":
+        return "human_escalation"
+    if status != "ok":
+        return "agent"            # "retry": schema error, give Coder another chance
+
+    # Skip Reviewer when there are no code changes to review.
+    # Pure action tasks (e.g. delete/upload with no file writes) have nothing
+    # for the Reviewer to audit — routing them through reviewer_agent would cause
+    # stale fallback risk scores to misfire human_escalation.
+    tr = state.get("task_report") or {}
+    has_code_changes = bool(tr.get("modified_files")) or bool(tr.get("test_executed"))
+    if not has_code_changes:
+        return "end"
+
+    return "reviewer_agent"
 
 
 # ──────────────────────────────────────────────────────────────
 # Compile graph
 # ──────────────────────────────────────────────────────────────
 
-workflow = StateGraph(MessagesState)
-workflow.add_node("agent",          call_model)
-workflow.add_node("pre_tool_check", pre_tool_check)
-workflow.add_node("tools",          tool_node)
+workflow = StateGraph(DaedalusState)
+workflow.add_node("agent",            call_model)
+workflow.add_node("pre_tool_check",   pre_tool_check)
+workflow.add_node("tools",            tool_node)
+workflow.add_node("task_reporter",    task_reporter)
+workflow.add_node("reviewer_agent",   reviewer_agent)
+workflow.add_node("context_surgeon",  context_surgeon)
+workflow.add_node("human_escalation", human_escalation)
+workflow.add_node("tool_enforcer",    tool_enforcer)
 
 workflow.set_entry_point("agent")
 workflow.add_conditional_edges(
     "agent", route_after_agent,
-    {"pre_tool_check": "pre_tool_check", "tools": "tools", "end": END},
+    {
+        "pre_tool_check":  "pre_tool_check",
+        "tools":           "tools",
+        "task_reporter":   "task_reporter",
+        "tool_enforcer":   "tool_enforcer",
+        "human_escalation":"human_escalation",
+        "end":             END,
+    },
 )
+workflow.add_edge("tool_enforcer", "agent")
 workflow.add_edge("pre_tool_check", "tools")
 workflow.add_edge("tools", "agent")
+workflow.add_conditional_edges(
+    "task_reporter", route_after_task_reporter,
+    {
+        "agent":            "agent",
+        "human_escalation": "human_escalation",
+        "reviewer_agent":   "reviewer_agent",
+        "end":              END,
+    },
+)
+workflow.add_conditional_edges(
+    "reviewer_agent", route_after_reviewer,
+    {
+        "context_surgeon":  "context_surgeon",
+        "human_escalation": "human_escalation",
+        "end":              END,
+    },
+)
+workflow.add_edge("context_surgeon",  "agent")
+workflow.add_edge("human_escalation", END)
 
 checkpointer = MemorySaver()
 
 app = workflow.compile(
     checkpointer=checkpointer,
-    interrupt_before=["pre_tool_check"],
+    interrupt_before=["pre_tool_check", "human_escalation"],
 )
