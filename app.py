@@ -1,58 +1,48 @@
-import asyncio
-import os
+import re
 import chainlit as cl
 from langchain_core.messages import ToolMessage
-from agent import app as graph, DANGEROUS_TOOL_NAMES
+from agent import app as graph, FORCE_ESCALATION_MARKER
+
+# Per-task bookkeeping fields reset at the start of every new user turn so a
+# previous task's report/review/counters can't leak into the next one.
+_PER_TASK_RESET = {
+    "task_report":          None,
+    "review_result":        None,
+    "retry_count":          0,
+    "schema_error_count":   0,
+    "total_iterations":     0,
+    "last_task_iterations": 0,
+    "original_task":        "",
+    "task_reporter_status": "",
+    "retry_messages":       None,
+}
 
 
 # ──────────────────────────────────────────────────────────────
-# Action callbacks (Chainlit 2.x requires explicit registration)
+# Human-in-the-loop action prompt
 # ──────────────────────────────────────────────────────────────
-
-def _fire_action(value: str) -> None:
-    """Called from action callbacks to resolve the pending _ask_actions wait."""
-    event: asyncio.Event = cl.user_session.get("_pending_action_event")
-    if event:
-        cl.user_session.set("_pending_action_value", value)
-        event.set()
-
-
-@cl.action_callback("approve")
-async def _cb_approve(action: cl.Action):
-    _fire_action("approve")
-
-
-@cl.action_callback("reject")
-async def _cb_reject(action: cl.Action):
-    _fire_action("reject")
-
-
-@cl.action_callback("resume")
-async def _cb_resume(action: cl.Action):
-    _fire_action("resume")
-
-
-@cl.action_callback("abandon")
-async def _cb_abandon(action: cl.Action):
-    _fire_action("abandon")
-
 
 async def _ask_actions(content: str, actions: list, timeout: int = 900) -> str | None:
     """
-    Send a message with action buttons and wait for one to be clicked.
-    Returns the action name that was clicked, or None on timeout.
+    Ask the user to pick an action and block until they click.
+
+    Uses Chainlit's native ask protocol (AskActionMessage), NOT a plain
+    cl.Message with actions. This is load-bearing: the escalation prompt fires
+    while the @cl.on_message handler is still running (we're paused at a graph
+    interrupt), and Chainlit renders action buttons on an ordinary message as
+    DISABLED for the whole duration of an active run — so the previous
+    asyncio.Event approach left the 放棄/核准 buttons greyed out and un-clickable
+    in the real UI (no POST /project/action ever fired). AskActionMessage marks
+    the buttons as an awaited question, which the frontend keeps enabled mid-run.
+
+    Returns the chosen action's name, or None on timeout.
     """
-    event = asyncio.Event()
-    cl.user_session.set("_pending_action_event", event)
-    cl.user_session.set("_pending_action_value", None)
-    await cl.Message(content=content, actions=actions).send()
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-        return cl.user_session.get("_pending_action_value")
-    except asyncio.TimeoutError:
-        return None
-    finally:
-        cl.user_session.set("_pending_action_event", None)
+    res = await cl.AskActionMessage(
+        content=content,
+        actions=actions,
+        timeout=timeout,
+    ).send()
+    return res.get("name") if res else None
 
 
 @cl.on_chat_start
@@ -72,7 +62,34 @@ def _config() -> dict:
     return {"configurable": {"thread_id": cl.user_session.get("thread_id")}}
 
 
-async def _display_inline_reviewer_card(rr: dict, retry_count: int) -> None:
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+
+def _clean_model_text(content, has_tool_calls: bool) -> str:
+    """
+    Normalise a Coder message for display and drop stray template fragments.
+    Local models (gemma via Ollama) occasionally leak end-of-turn artifacts —
+    lone tokens like 'end' / <end_of_turn> / short foreign-language junk —
+    during tool-call rounds; rendered raw they show up as "Raw code" boxes.
+    """
+    if isinstance(content, list):
+        content = "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+        )
+    text = (content or "").replace("<end_of_turn>", "").replace("<start_of_turn>", "")
+    text = text.strip()
+    if not text:
+        return ""
+    core = text.strip("`'\" \n\t")
+    if core.lower() in {"end", "'end'", "end_of_turn", "eot"}:
+        return ""
+    # Tool-call rounds with a short non-CJK fragment → leaked template noise.
+    if has_tool_calls and len(core) < 12 and not _CJK_RE.search(core):
+        return ""
+    return text
+
+
+async def _display_inline_reviewer_card(rr: dict, review_round: int) -> None:
     """
     Real-time reviewer summary card — fires after each reviewer_agent run
     without pausing the loop. Shown as an informational message only;
@@ -94,7 +111,7 @@ async def _display_inline_reviewer_card(rr: dict, retry_count: int) -> None:
                 f"- {i['description']}" for i in minor_issues
             )
         card = (
-            f"## ✅ 第 {retry_count} 輪 Reviewer 審查通過\n\n"
+            f"## ✅ 第 {review_round} 輪 Reviewer 審查通過\n\n"
             f"**Reviewer 風險評估**：{_risk.get(reviewer_risk,'❓')} {reviewer_risk}\n\n"
             f"**確認 OK 的面向：**\n{aspects_txt}"
             f"{minor_txt}"
@@ -108,7 +125,7 @@ async def _display_inline_reviewer_card(rr: dict, retry_count: int) -> None:
             for i in issues
         ) or "（無具體問題清單）"
         card = (
-            f"## 🔄 第 {retry_count} 輪 Reviewer 要求修正\n\n"
+            f"## 🔄 第 {review_round} 輪 Reviewer 要求修正\n\n"
             f"**結論**：{rr.get('one_line_summary','')}\n\n"
             f"**問題清單：**\n\n{issues_txt}\n\n"
             f"*Coder 正在自動修正，無需等待……*"
@@ -117,27 +134,78 @@ async def _display_inline_reviewer_card(rr: dict, retry_count: int) -> None:
     await cl.Message(content=card).send()
 
 
-async def _stream_graph(inputs, config: dict, msg: cl.Message) -> None:
-    """Stream graph events into msg, with real-time forge progress and reviewer cards."""
-    _coder_round = 0
+async def _stream_graph(inputs, config: dict) -> None:
+    """
+    Stream graph events into per-round messages, with real-time forge progress
+    and reviewer cards.
+
+    Each Coder round gets its OWN message directly under its round header —
+    never a shared accumulator. Tokens are accepted only from the "agent" node
+    (metadata filter), so Reviewer output or routing internals can never bleed
+    into the chat, and each round's text is replaced with the sanitised final
+    content when the round ends (drops leaked template fragments like 'end').
+    """
+    _coder_round  = 0
+    _review_round = 0
+    round_msg: cl.Message | None = None   # current Coder round's streaming target
+
     async for event in graph.astream_events(inputs, config=config, version="v2"):
         kind = event.get("event", "")
         name = event.get("name", "")
+        meta = event.get("metadata") or {}
 
         if kind == "on_chat_model_stream":
+            if meta.get("langgraph_node") != "agent":
+                continue        # only the Coder's own tokens belong in the chat
             token = event["data"]["chunk"].content
+            if isinstance(token, list):
+                token = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b) for b in token
+                )
             if token:
-                await msg.stream_token(token)
+                if round_msg is None:
+                    round_msg = cl.Message(content="")
+                await round_msg.stream_token(token)
 
         elif kind == "on_chain_start" and name == "agent":
             _coder_round += 1
             label = "初始分析" if _coder_round == 1 else f"第 {_coder_round} 輪修正"
             await cl.Message(content=f"---\n🤖 **Coder {label}**").send()
+            round_msg = None
+
+        elif kind == "on_chain_end" and name == "agent":
+            out_msgs = ((event.get("data") or {}).get("output") or {}).get("messages") or []
+            last     = out_msgs[-1] if out_msgs else None
+            tool_calls = getattr(last, "tool_calls", None) or []
+            final_text = _clean_model_text(getattr(last, "content", "") if last else "", bool(tool_calls))
+            if not final_text and tool_calls:
+                final_text = "*（Coder 未附說明，直接呼叫工具：" + "、".join(
+                    f"`{tc['name']}`" for tc in tool_calls
+                ) + "）*"
+            if round_msg is not None:
+                if final_text:
+                    round_msg.content = final_text
+                    await round_msg.update()
+                else:
+                    await round_msg.remove()
+                round_msg = None
+            elif final_text:
+                await cl.Message(content=final_text).send()
 
         elif kind == "on_chain_start" and name == "reviewer_agent":
-            await cl.Message(
-                content="🔍 **Reviewer 開始審查** — 評估面向：邏輯正確性、安全性、邊界條件、是否符合任務需求"
-            ).send()
+            _review_round += 1
+            st = (event.get("data") or {}).get("input") or {}
+            tr = (st.get("task_report") if isinstance(st, dict) else None) or {}
+            files_txt = "、".join(f"`{f}`" for f in (tr.get("modified_files") or [])) or "（無磁碟改動）"
+            await cl.Message(content=(
+                f"🔍 **Reviewer 第 {_review_round} 輪審查開始**\n\n"
+                f"- **評估目標**：{tr.get('task_description') or '（未提供）'}\n"
+                f"- **宣告改動檔案**：{files_txt}\n"
+                f"- **Coder 自評風險**：{tr.get('risk_level', '?')} — {tr.get('risk_reason', '')}\n"
+                f"- **檢查項目**：邏輯正確性、安全漏洞、邊界條件、"
+                f"測試真實性（對照 AST / TEST / DISK 機器標籤）、是否符合原始任務範圍\n\n"
+                f"*獨立審查中，完成後自動繼續，無需人工介入……*"
+            )).send()
 
         elif kind == "on_chain_start" and name == "tools":
             await cl.Message(content="🔧 **Coder 正在執行工具**，請稍候…").send()
@@ -163,9 +231,8 @@ async def _stream_graph(inputs, config: dict, msg: cl.Message) -> None:
         elif kind == "on_chain_end" and name == "reviewer_agent":
             output = (event.get("data") or {}).get("output") or {}
             rr     = output.get("review_result")
-            rc     = output.get("retry_count", 0)
             if rr and isinstance(rr, dict):
-                await _display_inline_reviewer_card(rr, rc)
+                await _display_inline_reviewer_card(rr, _review_round)
 
 
 async def _display_pipeline_cards(config: dict) -> None:
@@ -253,7 +320,8 @@ async def _display_completion_summary(config: dict) -> None:
         return
 
     retry_count = vals.get("retry_count") or 0
-    total_iter  = vals.get("total_iterations") or 0
+    # total_iterations is reset to 0 on submit; the display value is snapshotted
+    total_iter  = vals.get("last_task_iterations") or vals.get("total_iterations") or 0
     verdict     = rr.get("verdict", "")
     files       = tr.get("modified_files") or []
     files_txt   = "、".join(f"`{f}`" for f in files) if files else "（無磁碟改動）"
@@ -292,7 +360,13 @@ async def _handle_escalation(config: dict, state) -> None:
     schema_errors    = vals.get("schema_error_count") or 0
     total_iterations = vals.get("total_iterations") or 0
 
-    if total_iterations >= 6:
+    msgs        = vals.get("messages") or []
+    last_ai     = getattr(msgs[-1], "content", "") if msgs else ""
+    forced_test = "[FORCE_ESCALATION]" in (last_ai or "")
+
+    if forced_test:
+        reason = f"測試開關 {FORCE_ESCALATION_MARKER} 觸發（人工驗證用，非真實風險）"
+    elif total_iterations >= 6:
         reason = f"任務迭代次數超過上限（{total_iterations} 次 Coder 輪次），強制中止以防無限迴圈"
     elif schema_errors >= 2:
         reason = f"submit_task_completion schema 連續解析失敗（{schema_errors} 次）"
@@ -333,10 +407,7 @@ async def _handle_escalation(config: dict, state) -> None:
         ).send()
 
     # Advance through human_escalation → END regardless of choice.
-    resume_msg = cl.Message(content="")
-    await _stream_graph(None, config, resume_msg)
-    if resume_msg.content:
-        await resume_msg.update()
+    await _stream_graph(None, config)
 
     if chosen == "resume":
         await cl.Message(content="▶️ 已轉交人工，請重新下達指令。").send()
@@ -388,9 +459,7 @@ async def _handle_interrupt(config: dict) -> None:
 
     if chosen == "approve":
         # Resume — the graph will execute the pending tool(s) and continue.
-        resume_msg = cl.Message(content="")
-        await _stream_graph(None, config, resume_msg)
-        await resume_msg.update()
+        await _stream_graph(None, config)
         # Recurse: there may be another dangerous tool further in the chain.
         await _handle_interrupt(config)
 
@@ -417,10 +486,7 @@ async def _handle_interrupt(config: dict) -> None:
             {"messages": cancel_msgs},
             as_node="tools",
         )
-        cancel_reply = cl.Message(content="")
-        await _stream_graph(None, config, cancel_reply)
-        if cancel_reply.content:
-            await cancel_reply.update()
+        await _stream_graph(None, config)
         # Handle any follow-up interrupt (e.g. agent attempts another dangerous tool).
         await _handle_interrupt(config)
 
@@ -432,16 +498,22 @@ async def _handle_interrupt(config: dict) -> None:
 @cl.on_message
 async def main(message: cl.Message):
     config = _config()
-    inputs = {"messages": [("user", message.content)]}
-    msg    = cl.Message(content="")
+    # Reset per-task bookkeeping alongside the new message so the previous
+    # task's report/review/counters can't leak (stale completion card, wrong
+    # original_task anchor, premature hard-cap/escalation from carried counts).
+    # These channels use last-value semantics; messages uses add_messages, so
+    # the new turn is appended while the rest is overwritten atomically at entry.
+    inputs = {"messages": [("user", message.content)], **_PER_TASK_RESET}
+    # Fresh task → allow its completion/review cards to render again.
+    cl.user_session.set("_last_reviewed_task_id", None)
 
     try:
-        await _stream_graph(inputs, config, msg)
-        await msg.update()
+        await _stream_graph(inputs, config)
         await _handle_interrupt(config)
         await _display_pipeline_cards(config)
         await _display_completion_summary(config)
 
     except Exception as e:
-        msg.content = f"❌ 系統錯誤：\n```\n{e}\n```"
-        await msg.update()
+        await cl.Message(
+            content=f"❌ 系統錯誤（{type(e).__name__}）：\n```\n{e}\n```"
+        ).send()

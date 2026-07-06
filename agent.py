@@ -63,6 +63,7 @@ class DaedalusState(MessagesState):
     task_reporter_status: str         # "ok" | "retry" | "escalate" | ""
     retry_messages: Optional[list]    # selective-amnesia context from context_surgeon; cleared by call_model
     total_iterations: int             # Coder call_model runs since last successful submit; hard-capped at 6
+    last_task_iterations: int         # total_iterations snapshot at submit time (display only; survives the reset)
 
 
 SUBMIT_TOOL_NAME = "submit_task_completion"
@@ -997,6 +998,9 @@ reviewer_llm = ChatOllama(
     base_url=OLLAMA_BASE_URL,
     temperature=0.1,
     streaming=False,
+    # Reviewer input now embeds the machine-extracted tool_code + test_code;
+    # Ollama's default context is too small for system prompt + code blocks.
+    num_ctx=8192,
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -1011,6 +1015,9 @@ SYSTEM_PROMPT = """你是配備多種工具的全能助理 Daedalus，專精日�
 3. 不確定的事實禁止臆測，應呼叫 web_search 查詢後再回答。
 4. 回覆一律使用繁體中文。
 5. 每次完成實作任務後，必須呼叫 submit_task_completion 提交結構化回報，不得用純文字代替。
+6. 每次收到新任務或 Reviewer 修正要求時，第一步必須先輸出 2-3 句說明文字：
+   「我要做什麼」與「打算怎麼做」（包含預計呼叫的工具與驗證方式），說完立即接著呼叫工具，
+   不得只呼叫工具而完全沒有說明，也不得說完就停下來等使用者確認。
 
 【建立／修改工具的強制流程 — 最常見的違規情境】
 當任務涉及「建立、撰寫、修改任何 Python 函式或工具」，唯一合法的完成方式是：
@@ -1089,9 +1096,26 @@ REVIEWER_SYSTEM_PROMPT = """你是一位嚴格的程式碼審查員（Code Revie
   兩個條件都不成立 → 禁止使用 category: "scope"
 ═══════════════════════════════════════════════════════
 
+═══════════════════════════════════════════════════════
+【測試有效性檢查 — 必查維度】
+═══════════════════════════════════════════════════════
+輸入若包含【實際提交的 test_code】，必須判斷「測試是否真的驗證了核心邏輯」，
+不是形式上通過就好。以下任一情況成立，即為「測試無效或被弱化」，
+必須列為 severity=blocker、category=test，且 verdict 必須是 needs_changes：
+  1. 測試斷言被簡化或刪除（例如只剩 assertTrue(True)、空的測試方法）
+  2. 測試只驗證無關緊要的邊角（例如只測函式 callable、只測回傳型別，
+     完全沒有驗證計算結果或核心行為）
+  3. 測試條件過於寬鬆（例如用範圍斷言取代精確值、只斷言不拋例外）
+  4. 測試根本沒有呼叫被測函式
+  5. 原始任務明確要求的行為（如邊界條件、例外處理）沒有任何斷言覆蓋
+描述請寫明「測試無效或被弱化」並指出是哪一種手法。
+若 Coder 宣稱測試通過但輸入中沒有 test_code 可查驗，在 issues 標記
+「資訊不足，需要人工確認測試有效性」。
+
 行為規範：
 1. 凡有疑慮，必須列為 issue，不得因「看起來應該 OK」而放行。
 2. 你看不到實作者的推理過程——這是刻意的設計，你的判斷必須完全基於改動的結果。
+   改動摘要是 Coder 自報的，可能與實際程式碼不符；以機器擷取的 tool_code / test_code 為準。
 3. 若任何欄位資訊不足以判斷，在 issues 中標記「資訊不足，需要人工確認」。
 
 verdict 判定規則（必須遵守）：
@@ -1105,13 +1129,16 @@ verdict 判定規則（必須遵守）：
   "verdict": "approve",
   "reviewer_risk": "low",
   "issues": [],
-  "approved_aspects": ["邏輯正確", "邊界處理完整", "符合原始任務需求"],
+  "approved_aspects": ["邏輯正確：<引用改動摘要中的具體行為>", "測試真實性：<引用 AST/TEST/DISK 機器標籤的實際值>"],
   "one_line_summary": "一句話結論"
 }
 
 【approved_aspects 填寫規則——必須遵守】
 - 不得為空陣列 []
-- 每條必須是具體說明，例如：「邏輯正確：factorial(5)=120 計算正確」、「邊界處理：負數拋 ValueError」
+- 每條必須引用「本次任務的具體事實」：改動摘要的內容、機器標籤（AST_RESULT / TEST_RESULT /
+  DISK_WRITE_RESULT）的實際值、modified_files 的實際路徑等
+- 禁止輸出籠統套話（如「邏輯正確」「邊界處理完整」「符合原始任務需求」這類沒有依據的空泛字句），
+  也禁止照抄上方範例中的 <> 佔位文字——必須換成本次審查的實際內容
 - 若 verdict = "approve"，approved_aspects 至少要有 2 條
 - 若 verdict = "needs_changes"，至少要有 1 條（說明哪些面向是 OK 的）
 
@@ -1155,11 +1182,37 @@ def _extract_disk_write_result(messages: list) -> Optional[str]:
     return _extract_tagged_result(messages, "DISK_WRITE_RESULT")
 
 
+def _extract_last_forge_code(messages: list) -> tuple[Optional[str], Optional[str]]:
+    """Return (tool_code, test_code) from the most recent forge_and_test_tool call.
+
+    Machine-extracted from the actual tool_calls history — NOT Coder-reported —
+    so the Reviewer can audit the real code and the real tests instead of
+    trusting change_summary.
+    """
+    for msg in reversed(messages):
+        for tc in reversed(getattr(msg, "tool_calls", None) or []):
+            if isinstance(tc, dict) and tc.get("name") == "forge_and_test_tool":
+                args = tc.get("args") or {}
+                return args.get("tool_code"), args.get("test_code")
+    return None, None
+
+
+def _clip_code(text: Optional[str], limit: int) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "（未提供）"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…（超過 {limit} 字元已截斷）"
+
+
 def _build_reviewer_input(
     task_report: dict,
     original_task: str,
     ast_scan_result: Optional[str],
     disk_write_result: Optional[str] = None,
+    tool_code: Optional[str] = None,
+    test_code: Optional[str] = None,
 ) -> str:
     modified_files  = task_report.get("modified_files") or []
     change_summary  = task_report.get("change_summary", "（無摘要）")
@@ -1183,10 +1236,22 @@ def _build_reviewer_input(
     files_txt = "\n".join(f"- {f}" for f in modified_files) or "- （無改動）"
     tools_txt = ", ".join(tool_calls_made) or "（無）"
 
+    # test_code is the cheat-detection anchor — always attach it in full
+    # (clip only at an absurd size); tool_code may be clipped harder.
+    code_section = ""
+    if tool_code or test_code:
+        code_section = (
+            f"【實際提交的 tool_code（機器擷取，非 Coder 自報）】\n"
+            f"```python\n{_clip_code(tool_code, 1500)}\n```\n\n"
+            f"【實際提交的 test_code（機器擷取——必須審查測試有效性）】\n"
+            f"```python\n{_clip_code(test_code, 4000)}\n```\n\n"
+        )
+
     return (
         f"請審查以下任務的完成情況。\n\n"
         f"【原始任務需求】\n{original_task or '（未記錄）'}\n\n"
-        f"【改動摘要】\n{change_summary}\n\n"
+        f"【改動摘要（Coder 自報，可能不誠實）】\n{change_summary}\n\n"
+        f"{code_section}"
         f"【宣告改動的檔案（modified_files）】\n{files_txt}\n\n"
         f"【測試狀態（Coder 自報）】\n{test_status}\n\n"
         f"【實作者自評風險等級】\n{risk_level} — {risk_reason}\n\n"
@@ -1254,7 +1319,72 @@ def _strip_false_scope_issues(result: ReviewResult) -> ReviewResult:
     )
 
 
+# Aspects that are prompt-example parroting or contentless boilerplate — treated as absent.
+_GENERIC_ASPECTS = {
+    "邏輯正確", "邊界處理完整", "符合原始任務需求", "程式碼審查通過",
+    "無具體說明", "無法評估", "一句話結論",
+}
+
+
+def _ensure_approved_aspects(
+    result: ReviewResult,
+    task_report: dict,
+    ast_scan_result: Optional[str],
+    disk_write_result: Optional[str],
+) -> ReviewResult:
+    """
+    Guarantee approved_aspects carries concrete content: approve → >= 2 entries,
+    needs_changes → >= 1. Drops prompt-example parroting / placeholder text and
+    tops up from machine-verifiable facts (AST / TEST / DISK tags, report fields).
+    """
+    kept = []
+    for a in result.approved_aspects:
+        a = (a or "").strip()
+        if not a or a in _GENERIC_ASPECTS or a.startswith("<") or "佔位" in a or "具體面向" in a:
+            continue
+        kept.append(a)
+
+    required = 2 if result.verdict == "approve" else 1
+    if len(kept) >= required:
+        if kept == result.approved_aspects:
+            return result
+        return result.model_copy(update={"approved_aspects": kept})
+
+    facts = []
+    if ast_scan_result and ast_scan_result.startswith("PASS"):
+        facts.append("安全性：AST 靜態掃描通過，無 import / exec / eval 等危險呼叫")
+    if task_report.get("test_executed") and task_report.get("test_passed"):
+        facts.append("測試真實性：forge_and_test_tool 回傳 [TEST_RESULT]PASS，單元測試確實執行且通過")
+    if disk_write_result and disk_write_result.startswith("SUCCESS"):
+        files = "、".join(task_report.get("modified_files") or []) or "（見回報）"
+        facts.append(f"磁碟一致性：DISK_WRITE_RESULT=SUCCESS，與宣告的 modified_files 相符（{files}）")
+    summary = (task_report.get("change_summary") or "").strip()
+    if summary:
+        facts.append(f"任務相符性：改動摘要「{summary[:60]}」與原始任務需求一致")
+
+    for f in facts:
+        if len(kept) >= required:
+            break
+        if f not in kept:
+            kept.append(f)
+    if not kept:
+        kept.append("（Reviewer 未提供具體面向，且無機器標籤可歸納——請以問題清單為準）")
+
+    return result.model_copy(update={"approved_aspects": kept})
+
+
 async def call_model(state: DaedalusState, config: RunnableConfig):
+    # Test hook: force escalation without spending an LLM call.
+    if _force_escalation_requested(state):
+        return {
+            "messages": [AIMessage(content=(
+                f"{_FORCE_ESCALATION_ACK} 偵測到測試開關 {FORCE_ESCALATION_MARKER}，"
+                "直接進入人工介入畫面（未呼叫模型）。"
+            ))],
+            "retry_messages":   None,
+            "total_iterations": (state.get("total_iterations") or 0) + 1,
+        }
+
     sys_msg = {"role": "system", "content": SYSTEM_PROMPT}
     # After context_surgeon sets retry_messages, use that clean slate;
     # otherwise use the full accumulated history.
@@ -1346,6 +1476,7 @@ def task_reporter(state: DaedalusState) -> dict:
             "original_task":        original_task_anchor,
             "schema_error_count":   0,
             "task_reporter_status": "ok",
+            "last_task_iterations": state.get("total_iterations") or 0,
             "total_iterations":     0,   # Reset counter on each successful submission
         }
 
@@ -1523,10 +1654,12 @@ async def reviewer_agent(state: DaedalusState) -> dict:
     original_task = state.get("original_task") or ""
     retry_count   = state.get("retry_count") or 0
 
-    ast_scan_result   = _extract_ast_result(state["messages"])
-    disk_write_result = _extract_disk_write_result(state["messages"])
-    reviewer_input    = _build_reviewer_input(
-        task_report, original_task, ast_scan_result, disk_write_result
+    ast_scan_result      = _extract_ast_result(state["messages"])
+    disk_write_result    = _extract_disk_write_result(state["messages"])
+    tool_code, test_code = _extract_last_forge_code(state["messages"])
+    reviewer_input       = _build_reviewer_input(
+        task_report, original_task, ast_scan_result, disk_write_result,
+        tool_code, test_code,
     )
 
     try:
@@ -1536,6 +1669,7 @@ async def reviewer_agent(state: DaedalusState) -> dict:
         ])
         result = _parse_review_result(response.content)
         result = _strip_false_scope_issues(result)
+        result = _ensure_approved_aspects(result, task_report, ast_scan_result, disk_write_result)
     except Exception as e:
         result = ReviewResult(
             verdict="needs_changes",
@@ -1579,6 +1713,33 @@ def route_after_reviewer(state: DaedalusState) -> str:
 
 _ENFORCER_MARKER = "[TOOL_ENFORCER]"
 
+# Deterministic test hook: a task containing this token routes straight to
+# human_escalation without an LLM call. Exists because a task-based hard-cap
+# trigger is unreliable — the Coder controls the sandbox and can always make
+# forge pass with a trivial version, so it can't be forced to fail 6 rounds.
+# This lets an operator exercise the escalation UI (e.g. the 放棄此任務 button)
+# on demand. The token is deliberately obscure and never appears in normal use.
+FORCE_ESCALATION_MARKER = "__FORCE_ESCALATION__"
+_FORCE_ESCALATION_ACK = "[FORCE_ESCALATION]"
+
+
+def _latest_user_task(messages: list) -> str:
+    """Return the most recent genuine user task text (skips synthetic
+    enforcer / reviewer-feedback HumanMessages injected by the graph)."""
+    for m in reversed(messages):
+        if not isinstance(m, HumanMessage):
+            continue
+        c = m.content or ""
+        if c.startswith(_ENFORCER_MARKER) or c.startswith("[已完成操作摘要") \
+                or "[Reviewer 審查結果" in c:
+            continue
+        return c
+    return ""
+
+
+def _force_escalation_requested(state: DaedalusState) -> bool:
+    return FORCE_ESCALATION_MARKER in _latest_user_task(state["messages"])
+
 
 def tool_enforcer(state: DaedalusState) -> dict:
     """
@@ -1598,6 +1759,10 @@ def tool_enforcer(state: DaedalusState) -> dict:
 
 
 def route_after_agent(state: DaedalusState) -> str:
+    # Deterministic test hook — force escalation on demand.
+    if _force_escalation_requested(state):
+        return "human_escalation"
+
     # Hard iteration cap — catches forge-fail loops that bypass retry_count.
     if (state.get("total_iterations") or 0) >= 6:
         return "human_escalation"
